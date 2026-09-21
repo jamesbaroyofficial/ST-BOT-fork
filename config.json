@@ -27,7 +27,7 @@
     "notes": "Bio update system. When enabled, bot will update user bio on startup. If updateOnce is true, bio will only be updated once and not on every restart. Leave bioText empty to disable."
   },
   "antiInbox": true,
-  "nickNameBot": "ST | BOT",
+  "nickNameBot": "James Converter Bot",
   "prefix": "!",
   "usePrefix": {
     "enable": true,
