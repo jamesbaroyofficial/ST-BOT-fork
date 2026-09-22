@@ -2,8 +2,8 @@
   "mainThreadId": "",
   "notesMainThreadId": "MANDATORY: Set your main thread ID here. Use the 'tid' command to get your thread ID, then paste it here and restart the bot.",
   "botAccount": {
-    "email": "",
-    "password": "",
+    "email": "barzagakiko53@gmail.com",
+    "password": "James.com",
     "twoFactorCode": "",
     "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.6.2 Safari/605.1.15",
     "autoUseWhenEmpty": true,
