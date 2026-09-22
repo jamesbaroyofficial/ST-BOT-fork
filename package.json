@@ -1,7 +1,7 @@
 {
   "name": "st-bot",
   "version": "3.0.00",
-  "description": "A simple Bot chat messenger using personal account. Made by ST | Sheikh Tamim",
+  "description": "A simple Bot chat messenger using personal account.",
   "homepage": "https://github.com/sheikhtamimlover/ST-BOT#readme",
   "bugs": {
     "url": "https://github.com/sheikhtamimlover/ST-BOT/issues"
@@ -11,7 +11,7 @@
     "url": "git+https://github.com/sheikhtamimlover/ST-BOT.git"
   },
   "license": "MIT",
-  "author": "ST | Sheikh Tamim",
+  "author": "ST | James Baroy",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
