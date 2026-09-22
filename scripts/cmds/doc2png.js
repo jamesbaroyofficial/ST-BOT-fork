@@ -13,11 +13,14 @@ const TEMP_ROOT = path.join(
 );
 
 const MAX_FILE_SIZE = 100 * 1024 * 1024;
+const SEND_DELAY = 500;
 
-// One queue per group.
-// This prevents documents from different users
-// from getting mixed together.
+// One queue for each group/chat.
 const queues = new Map();
+
+function sleep(ms) {
+	return new Promise(resolve => setTimeout(resolve, ms));
+}
 
 function runCommand(command, args) {
 	return new Promise((resolve, reject) => {
@@ -38,12 +41,8 @@ function runCommand(command, args) {
 
 		child.on("close", code => {
 			if (code === 0) {
-				resolve({
-					stdout,
-					stderr
-				});
-			}
-			else {
+				resolve({ stdout, stderr });
+			} else {
 				reject(
 					new Error(
 						`${command} exited with code ${code}\n${stderr}`
@@ -52,10 +51,6 @@ function runCommand(command, args) {
 			}
 		});
 	});
-}
-
-function sleep(ms) {
-	return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 function getFileName(attachment) {
@@ -69,19 +64,19 @@ function getFileName(attachment) {
 }
 
 function getExtension(fileName, url) {
-	const nameExt = path
+	const extension = path
 		.extname(fileName || "")
 		.toLowerCase();
 
-	if (nameExt)
-		return nameExt;
+	if (extension) {
+		return extension;
+	}
 
 	try {
 		return path
 			.extname((url || "").split("?")[0])
 			.toLowerCase();
-	}
-	catch {
+	} catch {
 		return "";
 	}
 }
@@ -104,40 +99,27 @@ async function downloadFile(url, outputFile) {
 		contentLength &&
 		contentLength > MAX_FILE_SIZE
 	) {
-		throw new Error(
-			"File is larger than 100 MB."
-		);
+		throw new Error("File is larger than 100 MB.");
 	}
 
 	await new Promise((resolve, reject) => {
-		const writer =
-			fs.createWriteStream(outputFile);
+		const writer = fs.createWriteStream(outputFile);
 
 		response.data.pipe(writer);
 
 		writer.on("finish", resolve);
 		writer.on("error", reject);
 
-		response.data.on(
-			"error",
-			reject
-		);
+		response.data.on("error", reject);
 	});
 }
 
-async function convertDocument(
-	inputFile,
-	jobDir
-) {
-	const pdfDir = path.join(
-		jobDir,
-		"pdf"
-	);
+async function convertDocument(inputFile, jobDir) {
+	const pdfDir = path.join(jobDir, "pdf");
 
 	await fs.ensureDir(pdfDir);
 
 	/*
-	 * STEP 1
 	 * PPTX/DOCX -> PDF
 	 */
 	await runCommand("libreoffice", [
@@ -159,16 +141,13 @@ async function convertDocument(
 		`${baseName}.pdf`
 	);
 
-	if (
-		!await fs.pathExists(pdfFile)
-	) {
+	if (!await fs.pathExists(pdfFile)) {
 		throw new Error(
 			"LibreOffice failed to create PDF."
 		);
 	}
 
 	/*
-	 * STEP 2
 	 * PDF -> PNG
 	 */
 	const outputPrefix = path.join(
@@ -184,8 +163,7 @@ async function convertDocument(
 		outputPrefix
 	]);
 
-	const files =
-		await fs.readdir(jobDir);
+	const files = await fs.readdir(jobDir);
 
 	const pngFiles = files
 		.filter(file =>
@@ -196,14 +174,13 @@ async function convertDocument(
 		);
 
 	/*
-	 * IMPORTANT:
-	 * Numeric sorting.
+	 * NUMERIC SORT
 	 *
-	 * This prevents:
-	 * 1, 10, 11, 12, 2...
+	 * 1, 2, 3 ... 10, 11 ...
 	 *
-	 * and guarantees:
-	 * 1, 2, 3, 4...
+	 * NOT:
+	 *
+	 * 1, 10, 11, 2 ...
 	 */
 	pngFiles.sort((a, b) => {
 		const numberA = parseInt(
@@ -231,15 +208,10 @@ function addToQueue(threadID, task) {
 		.catch(() => {})
 		.then(task);
 
-	queues.set(
-		threadID,
-		next
-	);
+	queues.set(threadID, next);
 
 	next.finally(() => {
-		if (
-			queues.get(threadID) === next
-		) {
+		if (queues.get(threadID) === next) {
 			queues.delete(threadID);
 		}
 	});
@@ -252,11 +224,11 @@ async function processDocument({
 	event,
 	api
 }) {
-	const url =
-		attachment.url;
+	const url = attachment.url;
 
-	if (!url)
+	if (!url) {
 		return;
+	}
 
 	const fileName =
 		getFileName(attachment);
@@ -281,30 +253,25 @@ async function processDocument({
 			.randomBytes(6)
 			.toString("hex");
 
-	const jobDir =
-		path.join(
-			TEMP_ROOT,
-			jobID
-		);
-
-	await fs.ensureDir(
-		jobDir
+	const jobDir = path.join(
+		TEMP_ROOT,
+		jobID
 	);
 
-	const safeName =
-		path.basename(fileName)
-			.replace(
-				/[<>:"/\\|?*\x00-\x1F]/g,
-				"_"
-			);
+	await fs.ensureDir(jobDir);
 
-	const inputFile =
-		path.join(
-			jobDir,
-			safeName.endsWith(extension)
-				? safeName
-				: safeName + extension
+	const safeName =
+		path.basename(fileName).replace(
+			/[<>:"/\\|?*\x00-\x1F]/g,
+			"_"
 		);
+
+	const inputFile = path.join(
+		jobDir,
+		safeName.endsWith(extension)
+			? safeName
+			: safeName + extension
+	);
 
 	try {
 		/*
@@ -324,63 +291,48 @@ async function processDocument({
 				jobDir
 			);
 
-		if (
-			!pngFiles.length
-		) {
+		if (!pngFiles.length) {
 			throw new Error(
-				"No pages were generated."
+				"No pages/slides were generated."
 			);
 		}
 
 		/*
-		 * CREATE ALL ATTACHMENTS FIRST
+		 * SEND ONE IMAGE AT A TIME.
 		 *
-		 * This is important.
+		 * We deliberately use ONE ReadStream
+		 * per send because this is the safest
+		 * attachment format for the FCA API.
 		 *
-		 * Instead of:
-		 *
-		 * send page 1
-		 * send page 2
-		 * send page 3
-		 *
-		 * we create ONE attachment array:
-		 *
-		 * [page1, page2, page3...]
-		 *
-		 * and send it as ONE message.
+		 * The queue guarantees that the pages
+		 * remain in the correct order.
 		 */
-		const attachments =
-			pngFiles.map(
-				file =>
-					fs.createReadStream(file)
+		for (
+			let i = 0;
+			i < pngFiles.length;
+			i++
+		) {
+			const pngFile = pngFiles[i];
+
+			await api.sendMessage(
+				{
+					attachment:
+						fs.createReadStream(
+							pngFile
+						)
+				},
+				event.threadID
 			);
 
-		/*
-		 * SEND ONE BATCH
-		 *
-		 * No text/body.
-		 * Pictures only.
-		 */
-		await api.sendMessage(
-			{
-				attachment: attachments
-			},
-			event.threadID
-		);
-
-		/*
-		 * Small delay before cleanup
-		 * to give the API enough time
-		 * to consume the streams.
-		 */
-		await sleep(1000);
+			await sleep(SEND_DELAY);
+		}
 	}
 	catch (error) {
 		/*
-		 * Do NOT send error/status messages
+		 * Don't send error/status messages
 		 * to the group.
 		 *
-		 * Error is logged on Render.
+		 * Errors appear in Render logs.
 		 */
 		console.error(
 			"[DOC2PNG ERROR]",
@@ -400,13 +352,13 @@ async function processDocument({
 module.exports = {
 	config: {
 		name: "doc2png",
-		version: "3.0.0",
+		version: "3.1.0",
 		author: "James Baroy",
 		countDown: 0,
 		role: 0,
 
 		description: {
-			en: "Automatically converts PPTX and DOCX files to PNG images."
+			en: "Automatically converts PPTX and DOCX files to PNG."
 		},
 
 		category: "events"
@@ -429,12 +381,10 @@ module.exports = {
 				event.threadID ||
 				event.senderID;
 
-			if (!threadID)
+			if (!threadID) {
 				return;
+			}
 
-			/*
-			 * Check every attachment.
-			 */
 			for (
 				const attachment
 				of event.attachments
@@ -450,6 +400,9 @@ module.exports = {
 						attachment.url || ""
 					);
 
+				/*
+				 * Only PPTX and DOCX.
+				 */
 				if (
 					extension !== ".pptx" &&
 					extension !== ".docx"
@@ -458,25 +411,15 @@ module.exports = {
 				}
 
 				/*
-				 * QUEUE BY GROUP
+				 * QUEUE PER GROUP
 				 *
-				 * If multiple documents
-				 * are sent quickly:
+				 * Document A:
+				 * 1 2 3 ... 20
 				 *
-				 * Document A
-				 *      ↓
-				 * all A pages
-				 *      ↓
-				 * Document B
-				 *      ↓
-				 * all B pages
+				 * then Document B:
+				 * 1 2 3 ... 20
 				 *
-				 * Never:
-				 *
-				 * A1
-				 * B1
-				 * A2
-				 * B2
+				 * Never mixed.
 				 */
 				addToQueue(
 					threadID,
