@@ -8,7 +8,7 @@ const { spawn } = require("child_process");
 
 const TEMP_ROOT = path.join(process.cwd(), "tmp", "doc2png");
 const MAX_FILE_SIZE = 100 * 1024 * 1024;
-const SEND_DELAY = 500;
+const SEND_DELAY = 700;
 
 const queues = new Map();
 
@@ -23,8 +23,13 @@ function run(command, args) {
     let stdout = "";
     let stderr = "";
 
-    child.stdout.on("data", d => stdout += d.toString());
-    child.stderr.on("data", d => stderr += d.toString());
+    child.stdout.on("data", d => {
+      stdout += d.toString();
+    });
+
+    child.stderr.on("data", d => {
+      stderr += d.toString();
+    });
 
     child.on("error", reject);
 
@@ -32,13 +37,17 @@ function run(command, args) {
       if (code === 0) {
         resolve({ stdout, stderr });
       } else {
-        reject(new Error(`${command} failed: ${stderr || stdout}`));
+        reject(
+          new Error(
+            `${command} exited with code ${code}\n${stderr || stdout}`
+          )
+        );
       }
     });
   });
 }
 
-function isDocument(name) {
+function isSupported(name) {
   return /\.(pptx|docx)$/i.test(name || "");
 }
 
@@ -63,7 +72,7 @@ async function downloadFile(url, output) {
     method: "GET",
     url,
     responseType: "stream",
-    timeout: 120000,
+    timeout: 180000,
     maxContentLength: MAX_FILE_SIZE,
     maxBodyLength: MAX_FILE_SIZE
   });
@@ -79,17 +88,31 @@ async function downloadFile(url, output) {
   });
 }
 
-async function convertToPNG(inputFile, workDir) {
+async function convertDocument(inputFile, workDir) {
   const pdfDir = path.join(workDir, "pdf");
   const pngDir = path.join(workDir, "png");
+  const loProfile = path.join(workDir, "lo-profile");
 
   await fs.ensureDir(pdfDir);
   await fs.ensureDir(pngDir);
+  await fs.ensureDir(loProfile);
 
+  const profileURL =
+    "file://" + loProfile.replace(/\\/g, "/");
+
+  /*
+   * Use a completely separate LibreOffice profile.
+   * This prevents another LibreOffice process from interfering
+   * with the conversion.
+   */
   await run("libreoffice", [
     "--headless",
+    "--nologo",
+    "--nodefault",
+    "--nofirststartwizard",
+    `-env:UserInstallation=${profileURL}`,
     "--convert-to",
-    "pdf",
+    "pdf:impress_pdf_Export",
     "--outdir",
     pdfDir,
     inputFile
@@ -100,23 +123,52 @@ async function convertToPNG(inputFile, workDir) {
     path.extname(inputFile)
   );
 
-  const pdfFile = path.join(pdfDir, `${baseName}.pdf`);
+  const pdfFile = path.join(
+    pdfDir,
+    `${baseName}.pdf`
+  );
 
   if (!await fs.pathExists(pdfFile)) {
-    throw new Error("PDF conversion failed.");
+    throw new Error("LibreOffice did not create a PDF.");
   }
 
+  /*
+   * Ask Poppler how many pages were actually created.
+   */
+  const info = await run("pdfinfo", [pdfFile]);
+
+  const match = info.stdout.match(/Pages:\s+(\d+)/i);
+
+  const pageCount = match
+    ? parseInt(match[1], 10)
+    : 0;
+
+  console.log(
+    `[DOC2PNG] PDF pages detected: ${pageCount}`
+  );
+
+  if (pageCount < 1) {
+    throw new Error("PDF contains no pages.");
+  }
+
+  /*
+   * PDF → PNG
+   */
   await run("pdftoppm", [
     "-png",
     "-r",
-    "120",
+    "150",
+    "-f",
+    "1",
+    "-l",
+    String(pageCount),
     pdfFile,
     path.join(pngDir, "page")
   ]);
 
   const files = await fs.readdir(pngDir);
 
-  return files
+  const pages = files
     .filter(file => /^page-\d+\.png$/i.test(file))
     .sort((a, b) => {
       const A = parseInt(a.match(/\d+/)[0], 10);
@@ -124,6 +176,18 @@ async function convertToPNG(inputFile, workDir) {
       return A - B;
     })
     .map(file => path.join(pngDir, file));
+
+  console.log(
+    `[DOC2PNG] PNG pages generated: ${pages.length}`
+  );
+
+  if (pages.length !== pageCount) {
+    throw new Error(
+      `Expected ${pageCount} PNG pages but generated ${pages.length}.`
+    );
+  }
+
+  return pages;
 }
 
 async function processDocument(event, api, attachment) {
@@ -139,34 +203,64 @@ async function processDocument(event, api, attachment) {
     attachment.filename ||
     "document";
 
-  const safeName = originalName.replace(/[^\w.\- ]/g, "_");
-  const inputFile = path.join(workDir, safeName);
+  const safeName = originalName.replace(
+    /[^\w.\- ]/g,
+    "_"
+  );
+
+  const inputFile = path.join(
+    workDir,
+    safeName
+  );
 
   try {
     await fs.ensureDir(workDir);
 
     if (!attachment.url) {
-      throw new Error("Attachment URL not found.");
+      throw new Error("Attachment URL is missing.");
     }
 
-    await downloadFile(attachment.url, inputFile);
+    console.log(
+      `[DOC2PNG] Downloading ${originalName}`
+    );
+
+    await downloadFile(
+      attachment.url,
+      inputFile
+    );
 
     const stat = await fs.stat(inputFile);
 
+    console.log(
+      `[DOC2PNG] File size: ${(stat.size / 1024 / 1024).toFixed(2)} MB`
+    );
+
     if (stat.size > MAX_FILE_SIZE) {
-      throw new Error("File is larger than 100 MB.");
+      throw new Error("File exceeds 100 MB limit.");
     }
 
-    const pages = await convertToPNG(inputFile, workDir);
+    const pages = await convertDocument(
+      inputFile,
+      workDir
+    );
 
-    if (!pages.length) {
-      throw new Error("No pages were converted.");
-    }
+    console.log(
+      `[DOC2PNG] ${originalName} converted: ${pages.length} page(s)`
+    );
 
-    for (const page of pages) {
+    /*
+     * Send every page in exact order.
+     */
+    for (let i = 0; i < pages.length; i++) {
+      console.log(
+        `[DOC2PNG] Sending page ${i + 1}/${pages.length}`
+      );
+
       await api.sendMessage(
         {
-          attachment: fs.createReadStream(page)
+          attachment: fs.createReadStream(
+            pages[i]
+          )
         },
         threadID
       );
@@ -175,13 +269,16 @@ async function processDocument(event, api, attachment) {
     }
 
     console.log(
-      `[DOC2PNG] ${originalName} converted: ${pages.length} page(s)`
+      `[DOC2PNG] Finished ${originalName}`
     );
-  } catch (error) {
+  }
+  catch (error) {
     console.error(
-      `[DOC2PNG] ${originalName}: ${error.message}`
+      `[DOC2PNG] ERROR ${originalName}:`,
+      error.message
     );
-  } finally {
+  }
+  finally {
     await fs.remove(workDir).catch(() => {});
   }
 }
@@ -189,12 +286,12 @@ async function processDocument(event, api, attachment) {
 module.exports = {
   config: {
     name: "doc2png",
-    version: "4.1.0",
+    version: "5.0.0",
     author: "James Baroy",
     countDown: 0,
     role: 0,
     description: {
-      en: "Automatically converts DOCX and PPTX files to PNG."
+      en: "Automatically converts DOCX and PPTX files into PNG pages."
     },
     category: "utility"
   },
@@ -204,24 +301,38 @@ module.exports = {
   },
 
   onChat: async function ({ event, api }) {
-    if (!event || !event.threadID) return;
+    if (!event || !event.threadID) {
+      return;
+    }
 
-    if (!Array.isArray(event.attachments)) return;
+    if (!Array.isArray(event.attachments)) {
+      return;
+    }
 
-    const documents = event.attachments.filter(attachment => {
-      const name =
-        attachment.name ||
-        attachment.filename ||
-        "";
+    const documents = event.attachments.filter(
+      attachment => {
+        const name =
+          attachment.name ||
+          attachment.filename ||
+          "";
 
-      return isDocument(name);
-    });
+        return isSupported(name);
+      }
+    );
 
-    if (!documents.length) return;
+    if (!documents.length) {
+      return;
+    }
 
     for (const attachment of documents) {
-      enqueue(event.threadID, () =>
-        processDocument(event, api, attachment)
+      enqueue(
+        event.threadID,
+        () =>
+          processDocument(
+            event,
+            api,
+            attachment
+          )
       );
     }
   }
