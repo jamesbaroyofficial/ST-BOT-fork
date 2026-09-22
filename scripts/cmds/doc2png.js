@@ -18,9 +18,7 @@ const SEND_DELAY = 700;
 const queues = new Map();
 
 function sleep(ms) {
-  return new Promise(resolve =>
-    setTimeout(resolve, ms)
-  );
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 function run(command, args) {
@@ -44,10 +42,7 @@ function run(command, args) {
 
     child.on("close", code => {
       if (code === 0) {
-        resolve({
-          stdout,
-          stderr
-        });
+        resolve({ stdout, stderr });
       } else {
         reject(
           new Error(
@@ -64,22 +59,20 @@ function isSupported(name) {
 }
 
 /*
- * Keep documents from the same GC in order.
+ * Queue documents from the same GC.
  */
 function enqueue(threadID, task) {
   const previous =
-    queues.get(threadID) ||
-    Promise.resolve();
+    queues.get(threadID) || Promise.resolve();
 
-  const next =
-    previous
-      .catch(() => {})
-      .then(task)
-      .finally(() => {
-        if (queues.get(threadID) === next) {
-          queues.delete(threadID);
-        }
-      });
+  const next = previous
+    .catch(() => {})
+    .then(task)
+    .finally(() => {
+      if (queues.get(threadID) === next) {
+        queues.delete(threadID);
+      }
+    });
 
   queues.set(threadID, next);
 
@@ -87,49 +80,83 @@ function enqueue(threadID, task) {
 }
 
 /*
- * Get ST-FCA's authenticated cookie jar.
- *
- * ST-FCA exposes:
- * api.ctx.jar
+ * Create an authenticated request cookie jar
+ * from ST-FCA's current Facebook session.
  */
-function getFacebookJar(api) {
+function createFacebookJar(api, url) {
   if (
-    api &&
-    api.ctx &&
-    api.ctx.jar
+    !api ||
+    typeof api.getAppState !== "function"
   ) {
-    return api.ctx.jar;
+    throw new Error(
+      "ST-FCA getAppState() is unavailable."
+    );
   }
 
-  throw new Error(
-    "ST-FCA authenticated cookie jar is unavailable."
-  );
+  const appState = api.getAppState();
+
+  if (
+    !Array.isArray(appState) ||
+    appState.length === 0
+  ) {
+    throw new Error(
+      "Facebook session cookies are unavailable."
+    );
+  }
+
+  const jar = request.jar();
+
+  for (const item of appState) {
+    if (
+      !item ||
+      !item.key ||
+      item.value === undefined ||
+      item.value === null
+    ) {
+      continue;
+    }
+
+    try {
+      const cookie = request.cookie(
+        `${item.key}=${item.value}`
+      );
+
+      /*
+       * Do not print cookie values.
+       */
+      jar.setCookie(cookie, url);
+    } catch (error) {
+      console.error(
+        `[DOC2PNG] Cookie ${item.key} could not be loaded:`,
+        error.message
+      );
+    }
+  }
+
+  return jar;
 }
 
 /*
- * Download the Facebook attachment using
- * ST-FCA's own authenticated request style.
+ * Download the actual Facebook attachment.
  */
 function downloadFile(api, url, output) {
   return new Promise((resolve, reject) => {
     if (!url) {
       return reject(
-        new Error(
-          "Attachment URL is missing."
-        )
+        new Error("Attachment URL is missing.")
       );
     }
 
     let jar;
 
     try {
-      jar = getFacebookJar(api);
+      jar = createFacebookJar(api, url);
     } catch (error) {
       return reject(error);
     }
 
     console.log(
-      "[DOC2PNG] Downloading with ST-FCA authenticated session..."
+      "[DOC2PNG] Downloading with authenticated Facebook session..."
     );
 
     const userAgent =
@@ -139,9 +166,9 @@ function downloadFile(api, url, output) {
         api.ctx.globalOptions &&
         api.ctx.globalOptions.userAgent
       ) ||
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36";
 
-    const options = {
+    const download = request.get({
       url: url,
 
       method: "GET",
@@ -162,7 +189,7 @@ function downloadFile(api, url, output) {
         "User-Agent": userAgent,
 
         "Accept":
-          "application/octet-stream,application/vnd.openxmlformats-officedocument.presentationml.presentation,application/vnd.openxmlformats-officedocument.wordprocessingml.document,*/*",
+          "application/octet-stream,*/*",
 
         "Accept-Language":
           "en-US,en;q=0.9",
@@ -170,229 +197,166 @@ function downloadFile(api, url, output) {
         "Referer":
           "https://www.facebook.com/",
 
-        "Origin":
-          "https://www.facebook.com/",
-
-        "Cache-Control":
-          "no-cache",
-
-        "Pragma":
-          "no-cache",
-
         "Connection":
           "keep-alive"
       }
-    };
+    });
 
-    const download =
-      request.get(options);
+    let responseReceived = false;
+    let finished = false;
 
-    let responseStarted = false;
-    let bytes = 0;
-    let rejected = false;
+    function fail(error) {
+      if (finished) return;
 
-    const fail = error => {
-      if (rejected) return;
+      finished = true;
 
-      rejected = true;
-
-      download.destroy();
+      try {
+        download.destroy();
+      } catch (_) {}
 
       reject(error);
-    };
+    }
 
-    download.on(
-      "response",
-      response => {
-        responseStarted = true;
+    download.on("response", response => {
+      responseReceived = true;
 
-        console.log(
-          `[DOC2PNG] HTTP status: ${response.statusCode}`
-        );
+      console.log(
+        `[DOC2PNG] HTTP status: ${response.statusCode}`
+      );
 
-        console.log(
-          `[DOC2PNG] Final URL: ${response.request && response.request.uri ? response.request.uri.href : url}`
-        );
+      console.log(
+        `[DOC2PNG] Content-Type: ${
+          response.headers["content-type"] ||
+          "unknown"
+        }`
+      );
 
-        console.log(
-          `[DOC2PNG] Content-Type: ${
-            response.headers["content-type"] ||
-            "unknown"
-          }`
-        );
+      console.log(
+        `[DOC2PNG] Content-Length: ${
+          response.headers["content-length"] ||
+          "unknown"
+        }`
+      );
 
-        console.log(
-          `[DOC2PNG] Content-Length: ${
-            response.headers["content-length"] ||
-            "unknown"
-          }`
-        );
-
-        if (
-          response.statusCode < 200 ||
-          response.statusCode >= 400
-        ) {
-          fail(
-            new Error(
-              `Facebook returned HTTP ${response.statusCode}.`
-            )
-          );
-
-          return;
-        }
-
-        const contentType =
-          (
-            response.headers["content-type"] ||
-            ""
-          ).toLowerCase();
-
-        /*
-         * Facebook sometimes returns an HTML login/error page
-         * instead of the actual attachment.
-         */
-        if (
-          contentType.includes("text/html")
-        ) {
-          fail(
-            new Error(
-              "Facebook returned HTML instead of the actual document."
-            )
-          );
-
-          return;
-        }
-
-        const writer =
-          fs.createWriteStream(
-            output
-          );
-
-        download.on(
-          "data",
-          chunk => {
-            bytes += chunk.length;
-
-            if (
-              bytes >
-              MAX_FILE_SIZE
-            ) {
-              fail(
-                new Error(
-                  "Downloaded file exceeds 100 MB."
-                )
-              );
-            }
-          }
-        );
-
-        download.on(
-          "error",
-          error => {
-            writer.destroy();
-
-            fail(error);
-          }
-        );
-
-        writer.on(
-          "error",
-          error => {
-            fail(error);
-          }
-        );
-
-        writer.on(
-          "finish",
-          async () => {
-            if (rejected) return;
-
-            try {
-              const stat =
-                await fs.stat(
-                  output
-                );
-
-              console.log(
-                `[DOC2PNG] Downloaded size: ${(stat.size / 1024 / 1024).toFixed(2)} MB`
-              );
-
-              if (stat.size <= 0) {
-                return fail(
-                  new Error(
-                    "Downloaded attachment is 0 bytes."
-                  )
-                );
-              }
-
-              if (
-                stat.size >
-                MAX_FILE_SIZE
-              ) {
-                return fail(
-                  new Error(
-                    "Downloaded attachment exceeds 100 MB."
-                  )
-                );
-              }
-
-              resolve(stat.size);
-            } catch (error) {
-              fail(error);
-            }
-          }
-        );
-
-        download.pipe(writer);
-      }
-    );
-
-    download.on(
-      "error",
-      error => {
-        if (!responseStarted) {
-          fail(error);
-        }
-      }
-    );
-
-    download.on(
-      "abort",
-      () => {
-        fail(
+      if (
+        response.statusCode < 200 ||
+        response.statusCode >= 400
+      ) {
+        return fail(
           new Error(
-            "Facebook attachment download was aborted."
+            `Facebook returned HTTP ${response.statusCode}.`
           )
         );
       }
-    );
+
+      const contentType =
+        String(
+          response.headers["content-type"] || ""
+        ).toLowerCase();
+
+      /*
+       * Do not save Facebook login/error HTML
+       * as a PPTX/DOCX.
+       */
+      if (contentType.includes("text/html")) {
+        return fail(
+          new Error(
+            "Facebook returned HTML instead of the document."
+          )
+        );
+      }
+
+      const writer =
+        fs.createWriteStream(output);
+
+      let bytes = 0;
+
+      download.on("data", chunk => {
+        bytes += chunk.length;
+
+        if (bytes > MAX_FILE_SIZE) {
+          fail(
+            new Error(
+              "Downloaded file exceeds 100 MB."
+            )
+          );
+        }
+      });
+
+      download.on("error", error => {
+        writer.destroy();
+        fail(error);
+      });
+
+      writer.on("error", error => {
+        fail(error);
+      });
+
+      writer.on("finish", async () => {
+        if (finished) return;
+
+        try {
+          const stat =
+            await fs.stat(output);
+
+          console.log(
+            `[DOC2PNG] Downloaded size: ${(stat.size / 1024 / 1024).toFixed(2)} MB`
+          );
+
+          if (stat.size <= 0) {
+            return fail(
+              new Error(
+                "Downloaded attachment is 0 bytes."
+              )
+            );
+          }
+
+          if (stat.size > MAX_FILE_SIZE) {
+            return fail(
+              new Error(
+                "Downloaded attachment exceeds 100 MB."
+              )
+            );
+          }
+
+          finished = true;
+          resolve(stat.size);
+        } catch (error) {
+          fail(error);
+        }
+      });
+
+      download.pipe(writer);
+    });
+
+    download.on("error", error => {
+      if (!responseReceived) {
+        fail(error);
+      }
+    });
+
+    download.on("abort", () => {
+      fail(
+        new Error(
+          "Facebook attachment download was aborted."
+        )
+      );
+    });
   });
 }
 
 /*
- * Convert DOCX/PPTX -> PDF -> PNG.
+ * DOCX/PPTX -> PDF -> PNG
  */
-async function convertDocument(
-  inputFile,
-  workDir
-) {
+async function convertDocument(inputFile, workDir) {
   const pdfDir =
-    path.join(
-      workDir,
-      "pdf"
-    );
+    path.join(workDir, "pdf");
 
   const pngDir =
-    path.join(
-      workDir,
-      "png"
-    );
+    path.join(workDir, "png");
 
   const loProfile =
-    path.join(
-      workDir,
-      "lo-profile"
-    );
+    path.join(workDir, "lo-profile");
 
   await fs.ensureDir(pdfDir);
   await fs.ensureDir(pngDir);
@@ -400,30 +364,24 @@ async function convertDocument(
 
   const profileURL =
     "file://" +
-    loProfile.replace(
-      /\\/g,
-      "/"
-    );
+    loProfile.replace(/\\/g, "/");
 
-  await run(
-    "libreoffice",
-    [
-      "--headless",
-      "--nologo",
-      "--nodefault",
-      "--nofirststartwizard",
+  await run("libreoffice", [
+    "--headless",
+    "--nologo",
+    "--nodefault",
+    "--nofirststartwizard",
 
-      `-env:UserInstallation=${profileURL}`,
+    `-env:UserInstallation=${profileURL}`,
 
-      "--convert-to",
-      "pdf:impress_pdf_Export",
+    "--convert-to",
+    "pdf:impress_pdf_Export",
 
-      "--outdir",
-      pdfDir,
+    "--outdir",
+    pdfDir,
 
-      inputFile
-    ]
-  );
+    inputFile
+  ]);
 
   const baseName =
     path.basename(
@@ -437,34 +395,23 @@ async function convertDocument(
       `${baseName}.pdf`
     );
 
-  if (
-    !await fs.pathExists(
-      pdfFile
-    )
-  ) {
+  if (!await fs.pathExists(pdfFile)) {
     throw new Error(
       "LibreOffice did not create a PDF."
     );
   }
 
   const pdfStat =
-    await fs.stat(
-      pdfFile
-    );
+    await fs.stat(pdfFile);
 
-  if (
-    pdfStat.size <= 0
-  ) {
+  if (pdfStat.size <= 0) {
     throw new Error(
       "LibreOffice created an empty PDF."
     );
   }
 
   const info =
-    await run(
-      "pdfinfo",
-      [pdfFile]
-    );
+    await run("pdfinfo", [pdfFile]);
 
   const match =
     info.stdout.match(
@@ -473,76 +420,54 @@ async function convertDocument(
 
   const pageCount =
     match
-      ? parseInt(
-          match[1],
-          10
-        )
+      ? parseInt(match[1], 10)
       : 0;
 
   console.log(
     `[DOC2PNG] PDF pages detected: ${pageCount}`
   );
 
-  if (
-    pageCount < 1
-  ) {
+  if (pageCount < 1) {
     throw new Error(
       "PDF contains no pages."
     );
   }
 
-  await run(
-    "pdftoppm",
-    [
-      "-png",
-
-      "-r",
-      "150",
-
-      "-f",
-      "1",
-
-      "-l",
-      String(pageCount),
-
-      pdfFile,
-
-      path.join(
-        pngDir,
-        "page"
-      )
-    ]
-  );
+  await run("pdftoppm", [
+    "-png",
+    "-r",
+    "150",
+    "-f",
+    "1",
+    "-l",
+    String(pageCount),
+    pdfFile,
+    path.join(pngDir, "page")
+  ]);
 
   const files =
-    await fs.readdir(
-      pngDir
-    );
+    await fs.readdir(pngDir);
 
   const pages =
     files
       .filter(file =>
-        /^page-\d+\.png$/i.test(
-          file
-        )
+        /^page-\d+\.png$/i.test(file)
       )
-      .sort(
-        (a, b) => {
-          const A =
-            parseInt(
-              a.match(/\d+/)[0],
-              10
-            );
+      .sort((a, b) => {
+        const A =
+          parseInt(
+            a.match(/\d+/)[0],
+            10
+          );
 
-          const B =
-            parseInt(
-              b.match(/\d+/)[0],
-              10
-            );
+        const B =
+          parseInt(
+            b.match(/\d+/)[0],
+            10
+          );
 
-          return A - B;
-        }
-      )
+        return A - B;
+      })
       .map(file =>
         path.join(
           pngDir,
@@ -554,10 +479,7 @@ async function convertDocument(
     `[DOC2PNG] PNG pages generated: ${pages.length}`
   );
 
-  if (
-    pages.length !==
-    pageCount
-  ) {
+  if (pages.length !== pageCount) {
     throw new Error(
       `Expected ${pageCount} PNG pages but generated ${pages.length}.`
     );
@@ -567,42 +489,31 @@ async function convertDocument(
 }
 
 /*
- * Send one PNG.
+ * Send one PNG at a time.
  */
-function sendImage(
-  api,
-  file,
-  threadID
-) {
-  return new Promise(
-    (resolve, reject) => {
-      const stream =
-        fs.createReadStream(
-          file
-        );
+function sendImage(api, file, threadID) {
+  return new Promise((resolve, reject) => {
+    const stream =
+      fs.createReadStream(file);
 
-      stream.on(
-        "error",
-        reject
-      );
+    stream.on("error", reject);
 
-      api.sendMessage(
-        {
-          attachment: stream
-        },
+    api.sendMessage(
+      {
+        attachment: stream
+      },
 
-        threadID,
+      threadID,
 
-        error => {
-          if (error) {
-            reject(error);
-          } else {
-            resolve();
-          }
+      error => {
+        if (error) {
+          reject(error);
+        } else {
+          resolve();
         }
-      );
-    }
-  );
+      }
+    );
+  });
 }
 
 /*
@@ -619,7 +530,6 @@ async function processDocument(
   const workDir =
     path.join(
       TEMP_ROOT,
-
       `${Date.now()}-${crypto
         .randomBytes(6)
         .toString("hex")}`
@@ -643,13 +553,9 @@ async function processDocument(
     );
 
   try {
-    await fs.ensureDir(
-      workDir
-    );
+    await fs.ensureDir(workDir);
 
-    if (
-      !attachment.url
-    ) {
+    if (!attachment.url) {
       throw new Error(
         "Attachment URL is missing."
       );
@@ -675,9 +581,6 @@ async function processDocument(
       `[DOC2PNG] ${originalName} converted: ${pages.length} page(s)`
     );
 
-    /*
-     * Send pages in exact order.
-     */
     for (
       let i = 0;
       i < pages.length;
@@ -693,24 +596,20 @@ async function processDocument(
         threadID
       );
 
-      await sleep(
-        SEND_DELAY
-      );
+      await sleep(SEND_DELAY);
     }
 
     console.log(
       `[DOC2PNG] Finished ${originalName}`
     );
-  }
 
-  catch (error) {
+  } catch (error) {
     console.error(
       `[DOC2PNG] ERROR ${originalName}:`,
       error.message
     );
-  }
 
-  finally {
+  } finally {
     await fs
       .remove(workDir)
       .catch(() => {});
@@ -718,11 +617,10 @@ async function processDocument(
 }
 
 module.exports = {
-
   config: {
     name: "doc2png",
 
-    version: "7.0.0",
+    version: "8.0.0",
 
     author: "James Baroy",
 
@@ -738,14 +636,8 @@ module.exports = {
     category: "utility"
   },
 
-  /*
-   * Required by ST-BOT loader.
-   */
   onStart: async function () {},
 
-  /*
-   * Detect DOCX/PPTX attachments.
-   */
   onChat: async function ({
     event,
     api
@@ -773,15 +665,11 @@ module.exports = {
             attachment.filename ||
             "";
 
-          return isSupported(
-            name
-          );
+          return isSupported(name);
         }
       );
 
-    if (
-      !documents.length
-    ) {
+    if (!documents.length) {
       return;
     }
 
@@ -790,7 +678,6 @@ module.exports = {
     ) {
       enqueue(
         event.threadID,
-
         () =>
           processDocument(
             event,
