@@ -4,6 +4,7 @@ const fs = require("fs-extra");
 const path = require("path");
 const crypto = require("crypto");
 const request = require("request");
+const cheerio = require("cheerio");
 const { spawn } = require("child_process");
 
 const TEMP_ROOT = path.join(
@@ -42,7 +43,10 @@ function run(command, args) {
 
     child.on("close", code => {
       if (code === 0) {
-        resolve({ stdout, stderr });
+        resolve({
+          stdout,
+          stderr
+        });
       } else {
         reject(
           new Error(
@@ -59,20 +63,21 @@ function isSupported(name) {
 }
 
 /*
- * Queue documents from the same GC.
+ * Keep documents from the same GC in order.
  */
 function enqueue(threadID, task) {
   const previous =
     queues.get(threadID) || Promise.resolve();
 
-  const next = previous
-    .catch(() => {})
-    .then(task)
-    .finally(() => {
-      if (queues.get(threadID) === next) {
-        queues.delete(threadID);
-      }
-    });
+  const next =
+    previous
+      .catch(() => {})
+      .then(task)
+      .finally(() => {
+        if (queues.get(threadID) === next) {
+          queues.delete(threadID);
+        }
+      });
 
   queues.set(threadID, next);
 
@@ -80,10 +85,13 @@ function enqueue(threadID, task) {
 }
 
 /*
- * Create an authenticated request cookie jar
- * from ST-FCA's current Facebook session.
+ * Create Facebook cookie jar from api.getAppState().
+ *
+ * IMPORTANT:
+ * We do NOT put Facebook cookies on the
+ * Facebook CDN/file host.
  */
-function createFacebookJar(api, url) {
+function createFacebookJar(api) {
   if (
     !api ||
     typeof api.getAppState !== "function"
@@ -93,7 +101,8 @@ function createFacebookJar(api, url) {
     );
   }
 
-  const appState = api.getAppState();
+  const appState =
+    api.getAppState();
 
   if (
     !Array.isArray(appState) ||
@@ -104,7 +113,8 @@ function createFacebookJar(api, url) {
     );
   }
 
-  const jar = request.jar();
+  const jar =
+    request.jar();
 
   for (const item of appState) {
     if (
@@ -116,20 +126,40 @@ function createFacebookJar(api, url) {
       continue;
     }
 
+    const cookieString =
+      `${item.key}=${item.value}`;
+
     try {
-      const cookie = request.cookie(
-        `${item.key}=${item.value}`
-      );
+      const cookie =
+        request.cookie(
+          cookieString
+        );
 
       /*
-       * Do not print cookie values.
+       * If the saved cookie contains
+       * a domain, preserve it.
        */
-      jar.setCookie(cookie, url);
-    } catch (error) {
-      console.error(
-        `[DOC2PNG] Cookie ${item.key} could not be loaded:`,
-        error.message
-      );
+      const domain =
+        item.domain ||
+        "";
+
+      if (
+        domain.includes("messenger.com")
+      ) {
+        jar.setCookie(
+          cookie,
+          "https://www.messenger.com/"
+        );
+      } else {
+        jar.setCookie(
+          cookie,
+          "https://www.facebook.com/"
+        );
+      }
+    } catch (_) {
+      /*
+       * Never print cookie values.
+       */
     }
   }
 
@@ -137,251 +167,760 @@ function createFacebookJar(api, url) {
 }
 
 /*
- * Download the actual Facebook attachment.
+ * Request helper.
  */
-function downloadFile(api, url, output) {
-  return new Promise((resolve, reject) => {
-    if (!url) {
-      return reject(
-        new Error("Attachment URL is missing.")
+function requestBuffer(
+  url,
+  jar,
+  userAgent
+) {
+  return new Promise(
+    (resolve, reject) => {
+      const req =
+        request.get({
+          url,
+
+          jar,
+
+          gzip: true,
+
+          followRedirect: true,
+
+          followAllRedirects: true,
+
+          timeout: 180000,
+
+          encoding: null,
+
+          headers: {
+            "User-Agent":
+              userAgent,
+
+            "Accept":
+              "application/octet-stream,text/html,application/xhtml+xml,*/*",
+
+            "Accept-Language":
+              "en-US,en;q=0.9",
+
+            "Referer":
+              "https://www.facebook.com/",
+
+            "Connection":
+              "keep-alive"
+          }
+        });
+
+      req.on(
+        "response",
+        response => {
+          const chunks = [];
+
+          response.on(
+            "data",
+            chunk => {
+              chunks.push(chunk);
+
+              const total =
+                chunks.reduce(
+                  (sum, item) =>
+                    sum + item.length,
+                  0
+                );
+
+              if (
+                total >
+                MAX_FILE_SIZE
+              ) {
+                req.destroy(
+                  new Error(
+                    "Response exceeds 100 MB."
+                  )
+                );
+              }
+            }
+          );
+
+          response.on(
+            "end",
+            () => {
+              resolve({
+                statusCode:
+                  response.statusCode,
+
+                headers:
+                  response.headers,
+
+                finalUrl:
+                  response.request &&
+                  response.request.uri
+                    ? response.request.uri.href
+                    : url,
+
+                body:
+                  Buffer.concat(
+                    chunks
+                  )
+              });
+            }
+          );
+        }
+      );
+
+      req.on(
+        "error",
+        reject
       );
     }
+  );
+}
 
-    let jar;
-
-    try {
-      jar = createFacebookJar(api, url);
-    } catch (error) {
-      return reject(error);
-    }
-
-    console.log(
-      "[DOC2PNG] Downloading with authenticated Facebook session..."
+/*
+ * Find a real file/download URL inside
+ * Facebook's attachment preview HTML.
+ */
+function findDownloadUrl(
+  html,
+  originalUrl,
+  filename
+) {
+  const $ =
+    cheerio.load(
+      html
     );
 
-    const userAgent =
-      (
-        api &&
-        api.ctx &&
-        api.ctx.globalOptions &&
-        api.ctx.globalOptions.userAgent
-      ) ||
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36";
+  const candidates = [];
 
-    const download = request.get({
-      url: url,
+  /*
+   * All anchor links.
+   */
+  $("a[href]").each(
+    (_, element) => {
+      const href =
+        $(element).attr(
+          "href"
+        );
 
-      method: "GET",
-
-      jar: jar,
-
-      gzip: true,
-
-      followRedirect: true,
-
-      followAllRedirects: true,
-
-      timeout: 180000,
-
-      encoding: null,
-
-      headers: {
-        "User-Agent": userAgent,
-
-        "Accept":
-          "application/octet-stream,*/*",
-
-        "Accept-Language":
-          "en-US,en;q=0.9",
-
-        "Referer":
-          "https://www.facebook.com/",
-
-        "Connection":
-          "keep-alive"
+      if (href) {
+        candidates.push(
+          href
+        );
       }
-    });
-
-    let responseReceived = false;
-    let finished = false;
-
-    function fail(error) {
-      if (finished) return;
-
-      finished = true;
-
-      try {
-        download.destroy();
-      } catch (_) {}
-
-      reject(error);
     }
+  );
 
-    download.on("response", response => {
-      responseReceived = true;
+  /*
+   * Meta URLs.
+   */
+  $(
+    'meta[property="og:url"], meta[property="og:video"], meta[property="og:image"], meta[name="twitter:image"]'
+  ).each(
+    (_, element) => {
+      const content =
+        $(element).attr(
+          "content"
+        );
 
-      console.log(
-        `[DOC2PNG] HTTP status: ${response.statusCode}`
-      );
-
-      console.log(
-        `[DOC2PNG] Content-Type: ${
-          response.headers["content-type"] ||
-          "unknown"
-        }`
-      );
-
-      console.log(
-        `[DOC2PNG] Content-Length: ${
-          response.headers["content-length"] ||
-          "unknown"
-        }`
-      );
-
-      if (
-        response.statusCode < 200 ||
-        response.statusCode >= 400
-      ) {
-        return fail(
-          new Error(
-            `Facebook returned HTTP ${response.statusCode}.`
-          )
+      if (content) {
+        candidates.push(
+          content
         );
       }
+    }
+  );
 
-      const contentType =
-        String(
-          response.headers["content-type"] || ""
-        ).toLowerCase();
+  /*
+   * Raw HTML URLs.
+   */
+  const rawMatches =
+    html.match(
+      /https?:\\?\/\\?\/[^"'<> ]+/g
+    ) || [];
 
-      /*
-       * Do not save Facebook login/error HTML
-       * as a PPTX/DOCX.
-       */
-      if (contentType.includes("text/html")) {
-        return fail(
-          new Error(
-            "Facebook returned HTML instead of the document."
-          )
-        );
-      }
+  for (
+    const value of rawMatches
+  ) {
+    candidates.push(
+      value
+        .replace(/\\\//g, "/")
+        .replace(/\\"/g, '"')
+    );
+  }
 
-      const writer =
-        fs.createWriteStream(output);
+  const decodedName =
+    decodeURIComponent(
+      filename || ""
+    ).toLowerCase();
 
-      let bytes = 0;
-
-      download.on("data", chunk => {
-        bytes += chunk.length;
-
-        if (bytes > MAX_FILE_SIZE) {
-          fail(
-            new Error(
-              "Downloaded file exceeds 100 MB."
-            )
-          );
-        }
-      });
-
-      download.on("error", error => {
-        writer.destroy();
-        fail(error);
-      });
-
-      writer.on("error", error => {
-        fail(error);
-      });
-
-      writer.on("finish", async () => {
-        if (finished) return;
-
-        try {
-          const stat =
-            await fs.stat(output);
-
-          console.log(
-            `[DOC2PNG] Downloaded size: ${(stat.size / 1024 / 1024).toFixed(2)} MB`
-          );
-
-          if (stat.size <= 0) {
-            return fail(
-              new Error(
-                "Downloaded attachment is 0 bytes."
-              )
-            );
+  /*
+   * Normalize and remove duplicates.
+   */
+  const unique =
+    [...new Set(
+      candidates
+        .map(value => {
+          try {
+            return new URL(
+              value,
+              originalUrl
+            ).href;
+          } catch (_) {
+            return null;
           }
+        })
+        .filter(Boolean)
+    )];
 
-          if (stat.size > MAX_FILE_SIZE) {
-            return fail(
-              new Error(
-                "Downloaded attachment exceeds 100 MB."
-              )
-            );
-          }
+  /*
+   * Prefer links containing the filename.
+   */
+  const filenameMatch =
+    unique.find(url =>
+      url
+        .toLowerCase()
+        .includes(
+          decodedName
+        )
+    );
 
-          finished = true;
-          resolve(stat.size);
-        } catch (error) {
-          fail(error);
-        }
-      });
+  if (
+    filenameMatch
+  ) {
+    return filenameMatch;
+  }
 
-      download.pipe(writer);
-    });
+  /*
+   * Prefer obvious download/file URLs.
+   */
+  const downloadMatch =
+    unique.find(url => {
+      const lower =
+        url.toLowerCase();
 
-    download.on("error", error => {
-      if (!responseReceived) {
-        fail(error);
-      }
-    });
-
-    download.on("abort", () => {
-      fail(
-        new Error(
-          "Facebook attachment download was aborted."
+      return (
+        lower.includes(
+          "download"
+        ) ||
+        lower.includes(
+          "attachment"
+        ) ||
+        lower.includes(
+          ".pptx"
+        ) ||
+        lower.includes(
+          ".docx"
         )
       );
     });
-  });
+
+  if (
+    downloadMatch
+  ) {
+    return downloadMatch;
+  }
+
+  return null;
+}
+
+/*
+ * Build Facebook's attachment-preview URL.
+ */
+function buildPreviewUrl(
+  event,
+  attachment
+) {
+  if (
+    !event ||
+    !event.messageID ||
+    !event.threadID ||
+    !attachment ||
+    !attachment.ID
+  ) {
+    return null;
+  }
+
+  const params =
+    new URLSearchParams();
+
+  params.set(
+    "mid",
+    String(
+      event.messageID
+    )
+  );
+
+  params.set(
+    "threadid",
+    String(
+      event.threadID
+    )
+  );
+
+  params.set(
+    "fbid",
+    String(
+      attachment.ID
+    )
+  );
+
+  return (
+    "https://m.facebook.com/messages/attachment_preview/?" +
+    params.toString()
+  );
+}
+
+/*
+ * Try downloading the direct attachment URL.
+ */
+async function tryDirectDownload(
+  api,
+  attachment,
+  output
+) {
+  const url =
+    attachment.url;
+
+  if (!url) {
+    return {
+      success: false,
+      html: false
+    };
+  }
+
+  const jar =
+    createFacebookJar(
+      api
+    );
+
+  const userAgent =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+    "AppleWebKit/537.36 (KHTML, like Gecko) " +
+    "Chrome/131.0.0.0 Safari/537.36";
+
+  console.log(
+    "[DOC2PNG] Trying direct attachment URL..."
+  );
+
+  const response =
+    await requestBuffer(
+      url,
+      jar,
+      userAgent
+    );
+
+  console.log(
+    `[DOC2PNG] HTTP status: ${response.statusCode}`
+  );
+
+  console.log(
+    `[DOC2PNG] Content-Type: ${
+      response.headers["content-type"] ||
+      "unknown"
+    }`
+  );
+
+  console.log(
+    `[DOC2PNG] Content-Length: ${
+      response.headers["content-length"] ||
+      "unknown"
+    }`
+  );
+
+  const contentType =
+    String(
+      response.headers[
+        "content-type"
+      ] || ""
+    ).toLowerCase();
+
+  /*
+   * HTML means Facebook gave us a page,
+   * not the document.
+   */
+  if (
+    contentType.includes(
+      "text/html"
+    )
+  ) {
+    console.log(
+      "[DOC2PNG] Direct URL returned HTML."
+    );
+
+    return {
+      success: false,
+      html: true
+    };
+  }
+
+  if (
+    response.statusCode < 200 ||
+    response.statusCode >= 400
+  ) {
+    return {
+      success: false,
+      html: false
+    };
+  }
+
+  if (
+    !response.body ||
+    response.body.length <= 0
+  ) {
+    return {
+      success: false,
+      html: false
+    };
+  }
+
+  await fs.writeFile(
+    output,
+    response.body
+  );
+
+  const stat =
+    await fs.stat(
+      output
+    );
+
+  if (
+    stat.size <= 0
+  ) {
+    return {
+      success: false,
+      html: false
+    };
+  }
+
+  console.log(
+    `[DOC2PNG] Downloaded size: ${(stat.size / 1024 / 1024).toFixed(2)} MB`
+  );
+
+  return {
+    success: true,
+    html: false
+  };
+}
+
+/*
+ * Fallback:
+ * Facebook attachment preview page ->
+ * actual file URL.
+ */
+async function downloadFromPreview(
+  api,
+  event,
+  attachment,
+  output
+) {
+  const previewUrl =
+    buildPreviewUrl(
+      event,
+      attachment
+    );
+
+  if (!previewUrl) {
+    throw new Error(
+      "Cannot build Facebook attachment preview URL."
+    );
+  }
+
+  console.log(
+    "[DOC2PNG] Trying Facebook attachment preview..."
+  );
+
+  console.log(
+    `[DOC2PNG] Preview URL created for attachment ID ${attachment.ID}`
+  );
+
+  const jar =
+    createFacebookJar(
+      api
+    );
+
+  const userAgent =
+    "Mozilla/5.0 (Linux; Android 14) " +
+    "AppleWebKit/537.36 (KHTML, like Gecko) " +
+    "Chrome/131.0.0.0 Mobile Safari/537.36";
+
+  const preview =
+    await requestBuffer(
+      previewUrl,
+      jar,
+      userAgent
+    );
+
+  console.log(
+    `[DOC2PNG] Preview HTTP status: ${preview.statusCode}`
+  );
+
+  const previewType =
+    String(
+      preview.headers[
+        "content-type"
+      ] || ""
+    ).toLowerCase();
+
+  console.log(
+    `[DOC2PNG] Preview Content-Type: ${previewType || "unknown"}`
+  );
+
+  if (
+    preview.statusCode < 200 ||
+    preview.statusCode >= 400
+  ) {
+    throw new Error(
+      `Facebook attachment preview returned HTTP ${preview.statusCode}.`
+    );
+  }
+
+  const html =
+    preview.body.toString(
+      "utf8"
+    );
+
+  /*
+   * If Facebook redirects the preview directly
+   * to a binary file, save it.
+   */
+  if (
+    !previewType.includes(
+      "text/html"
+    )
+  ) {
+    if (
+      preview.body.length <= 0
+    ) {
+      throw new Error(
+        "Facebook preview returned an empty file."
+      );
+    }
+
+    await fs.writeFile(
+      output,
+      preview.body
+    );
+
+    return;
+  }
+
+  const fileUrl =
+    findDownloadUrl(
+      html,
+      preview.finalUrl ||
+        previewUrl,
+      attachment.name ||
+        attachment.filename ||
+        ""
+    );
+
+  if (!fileUrl) {
+    throw new Error(
+      "Facebook preview page did not contain a downloadable document URL."
+    );
+  }
+
+  console.log(
+    "[DOC2PNG] Found document download URL."
+  );
+
+  const fileResponse =
+    await requestBuffer(
+      fileUrl,
+      jar,
+      userAgent
+    );
+
+  console.log(
+    `[DOC2PNG] File HTTP status: ${fileResponse.statusCode}`
+  );
+
+  console.log(
+    `[DOC2PNG] File Content-Type: ${
+      fileResponse.headers[
+        "content-type"
+      ] || "unknown"
+    }`
+  );
+
+  const fileContentType =
+    String(
+      fileResponse.headers[
+        "content-type"
+      ] || ""
+    ).toLowerCase();
+
+  if (
+    fileContentType.includes(
+      "text/html"
+    )
+  ) {
+    throw new Error(
+      "Facebook download URL returned HTML instead of the document."
+    );
+  }
+
+  if (
+    fileResponse.statusCode < 200 ||
+    fileResponse.statusCode >= 400
+  ) {
+    throw new Error(
+      `Facebook file download returned HTTP ${fileResponse.statusCode}.`
+    );
+  }
+
+  if (
+    !fileResponse.body ||
+    fileResponse.body.length <= 0
+  ) {
+    throw new Error(
+      "Facebook returned a 0-byte document."
+    );
+  }
+
+  await fs.writeFile(
+    output,
+    fileResponse.body
+  );
+
+  const stat =
+    await fs.stat(
+      output
+    );
+
+  console.log(
+    `[DOC2PNG] Downloaded size: ${(stat.size / 1024 / 1024).toFixed(2)} MB`
+  );
+
+  if (
+    stat.size <= 0
+  ) {
+    throw new Error(
+      "Downloaded document is 0 bytes."
+    );
+  }
+}
+
+/*
+ * Main downloader.
+ */
+async function downloadFile(
+  api,
+  event,
+  attachment,
+  output
+) {
+  /*
+   * First try the URL supplied by ST-FCA.
+   */
+  try {
+    const direct =
+      await tryDirectDownload(
+        api,
+        attachment,
+        output
+      );
+
+    if (
+      direct.success
+    ) {
+      return;
+    }
+
+    /*
+     * If direct URL returned HTML,
+     * use attachment preview.
+     */
+    if (
+      direct.html
+    ) {
+      await downloadFromPreview(
+        api,
+        event,
+        attachment,
+        output
+      );
+
+      return;
+    }
+  } catch (error) {
+    console.log(
+      `[DOC2PNG] Direct download failed: ${error.message}`
+    );
+  }
+
+  /*
+   * Final fallback.
+   */
+  await downloadFromPreview(
+    api,
+    event,
+    attachment,
+    output
+  );
 }
 
 /*
  * DOCX/PPTX -> PDF -> PNG
  */
-async function convertDocument(inputFile, workDir) {
+async function convertDocument(
+  inputFile,
+  workDir
+) {
   const pdfDir =
-    path.join(workDir, "pdf");
+    path.join(
+      workDir,
+      "pdf"
+    );
 
   const pngDir =
-    path.join(workDir, "png");
+    path.join(
+      workDir,
+      "png"
+    );
 
   const loProfile =
-    path.join(workDir, "lo-profile");
+    path.join(
+      workDir,
+      "lo-profile"
+    );
 
-  await fs.ensureDir(pdfDir);
-  await fs.ensureDir(pngDir);
-  await fs.ensureDir(loProfile);
+  await fs.ensureDir(
+    pdfDir
+  );
+
+  await fs.ensureDir(
+    pngDir
+  );
+
+  await fs.ensureDir(
+    loProfile
+  );
 
   const profileURL =
     "file://" +
-    loProfile.replace(/\\/g, "/");
+    loProfile.replace(
+      /\\/g,
+      "/"
+    );
 
-  await run("libreoffice", [
-    "--headless",
-    "--nologo",
-    "--nodefault",
-    "--nofirststartwizard",
+  await run(
+    "libreoffice",
+    [
+      "--headless",
+      "--nologo",
+      "--nodefault",
+      "--nofirststartwizard",
 
-    `-env:UserInstallation=${profileURL}`,
+      `-env:UserInstallation=${profileURL}`,
 
-    "--convert-to",
-    "pdf:impress_pdf_Export",
+      "--convert-to",
+      "pdf:impress_pdf_Export",
 
-    "--outdir",
-    pdfDir,
+      "--outdir",
+      pdfDir,
 
-    inputFile
-  ]);
+      inputFile
+    ]
+  );
 
   const baseName =
     path.basename(
@@ -395,23 +934,34 @@ async function convertDocument(inputFile, workDir) {
       `${baseName}.pdf`
     );
 
-  if (!await fs.pathExists(pdfFile)) {
+  if (
+    !await fs.pathExists(
+      pdfFile
+    )
+  ) {
     throw new Error(
       "LibreOffice did not create a PDF."
     );
   }
 
   const pdfStat =
-    await fs.stat(pdfFile);
+    await fs.stat(
+      pdfFile
+    );
 
-  if (pdfStat.size <= 0) {
+  if (
+    pdfStat.size <= 0
+  ) {
     throw new Error(
       "LibreOffice created an empty PDF."
     );
   }
 
   const info =
-    await run("pdfinfo", [pdfFile]);
+    await run(
+      "pdfinfo",
+      [pdfFile]
+    );
 
   const match =
     info.stdout.match(
@@ -420,54 +970,71 @@ async function convertDocument(inputFile, workDir) {
 
   const pageCount =
     match
-      ? parseInt(match[1], 10)
+      ? parseInt(
+          match[1],
+          10
+        )
       : 0;
 
   console.log(
     `[DOC2PNG] PDF pages detected: ${pageCount}`
   );
 
-  if (pageCount < 1) {
+  if (
+    pageCount < 1
+  ) {
     throw new Error(
       "PDF contains no pages."
     );
   }
 
-  await run("pdftoppm", [
-    "-png",
-    "-r",
-    "150",
-    "-f",
-    "1",
-    "-l",
-    String(pageCount),
-    pdfFile,
-    path.join(pngDir, "page")
-  ]);
+  await run(
+    "pdftoppm",
+    [
+      "-png",
+      "-r",
+      "150",
+      "-f",
+      "1",
+      "-l",
+      String(pageCount),
+      pdfFile,
+      path.join(
+        pngDir,
+        "page"
+      )
+    ]
+  );
 
   const files =
-    await fs.readdir(pngDir);
+    await fs.readdir(
+      pngDir
+    );
 
   const pages =
     files
       .filter(file =>
-        /^page-\d+\.png$/i.test(file)
+        /^page-\d+\.png$/i.test(
+          file
+        )
       )
-      .sort((a, b) => {
-        const A =
-          parseInt(
-            a.match(/\d+/)[0],
-            10
-          );
+      .sort(
+        (a, b) => {
+          const A =
+            parseInt(
+              a.match(/\d+/)[0],
+              10
+            );
 
-        const B =
-          parseInt(
-            b.match(/\d+/)[0],
-            10
-          );
+          const B =
+            parseInt(
+              b.match(/\d+/)[0],
+              10
+            );
 
-        return A - B;
-      })
+          return A - B;
+        }
+      )
       .map(file =>
         path.join(
           pngDir,
@@ -479,7 +1046,10 @@ async function convertDocument(inputFile, workDir) {
     `[DOC2PNG] PNG pages generated: ${pages.length}`
   );
 
-  if (pages.length !== pageCount) {
+  if (
+    pages.length !==
+    pageCount
+  ) {
     throw new Error(
       `Expected ${pageCount} PNG pages but generated ${pages.length}.`
     );
@@ -489,31 +1059,43 @@ async function convertDocument(inputFile, workDir) {
 }
 
 /*
- * Send one PNG at a time.
+ * Send one PNG.
  */
-function sendImage(api, file, threadID) {
-  return new Promise((resolve, reject) => {
-    const stream =
-      fs.createReadStream(file);
+function sendImage(
+  api,
+  file,
+  threadID
+) {
+  return new Promise(
+    (resolve, reject) => {
+      const stream =
+        fs.createReadStream(
+          file
+        );
 
-    stream.on("error", reject);
+      stream.on(
+        "error",
+        reject
+      );
 
-    api.sendMessage(
-      {
-        attachment: stream
-      },
+      api.sendMessage(
+        {
+          attachment:
+            stream
+        },
 
-      threadID,
+        threadID,
 
-      error => {
-        if (error) {
-          reject(error);
-        } else {
-          resolve();
+        error => {
+          if (error) {
+            reject(error);
+          } else {
+            resolve();
+          }
         }
-      }
-    );
-  });
+      );
+    }
+  );
 }
 
 /*
@@ -553,11 +1135,16 @@ async function processDocument(
     );
 
   try {
-    await fs.ensureDir(workDir);
+    await fs.ensureDir(
+      workDir
+    );
 
-    if (!attachment.url) {
+    if (
+      !attachment.url &&
+      !attachment.ID
+    ) {
       throw new Error(
-        "Attachment URL is missing."
+        "Facebook attachment has no URL or ID."
       );
     }
 
@@ -567,9 +1154,27 @@ async function processDocument(
 
     await downloadFile(
       api,
-      attachment.url,
+      event,
+      attachment,
       inputFile
     );
+
+    const stat =
+      await fs.stat(
+        inputFile
+      );
+
+    console.log(
+      `[DOC2PNG] Final document size: ${(stat.size / 1024 / 1024).toFixed(2)} MB`
+    );
+
+    if (
+      stat.size <= 0
+    ) {
+      throw new Error(
+        "Final document is 0 bytes."
+      );
+    }
 
     const pages =
       await convertDocument(
@@ -581,6 +1186,9 @@ async function processDocument(
       `[DOC2PNG] ${originalName} converted: ${pages.length} page(s)`
     );
 
+    /*
+     * Send pages in exact order.
+     */
     for (
       let i = 0;
       i < pages.length;
@@ -596,7 +1204,9 @@ async function processDocument(
         threadID
       );
 
-      await sleep(SEND_DELAY);
+      await sleep(
+        SEND_DELAY
+      );
     }
 
     console.log(
@@ -620,7 +1230,7 @@ module.exports = {
   config: {
     name: "doc2png",
 
-    version: "8.0.0",
+    version: "9.0.0",
 
     author: "James Baroy",
 
@@ -665,11 +1275,15 @@ module.exports = {
             attachment.filename ||
             "";
 
-          return isSupported(name);
+          return isSupported(
+            name
+          );
         }
       );
 
-    if (!documents.length) {
+    if (
+      !documents.length
+    ) {
       return;
     }
 
@@ -678,6 +1292,7 @@ module.exports = {
     ) {
       enqueue(
         event.threadID,
+
         () =>
           processDocument(
             event,
