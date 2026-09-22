@@ -86,7 +86,6 @@ async function convertToPNG(inputFile, workDir) {
   await fs.ensureDir(pdfDir);
   await fs.ensureDir(pngDir);
 
-  // DOCX/PPTX → PDF
   await run("libreoffice", [
     "--headless",
     "--convert-to",
@@ -107,15 +106,12 @@ async function convertToPNG(inputFile, workDir) {
     throw new Error("PDF conversion failed.");
   }
 
-  // PDF → PNG
-  const prefix = path.join(pngDir, "page");
-
   await run("pdftoppm", [
     "-png",
     "-r",
     "120",
     pdfFile,
-    prefix
+    path.join(pngDir, "page")
   ]);
 
   const files = await fs.readdir(pngDir);
@@ -123,8 +119,8 @@ async function convertToPNG(inputFile, workDir) {
   return files
     .filter(file => /^page-\d+\.png$/i.test(file))
     .sort((a, b) => {
-      const A = parseInt(a.match(/\d+/)[0]);
-      const B = parseInt(b.match(/\d+/)[0]);
+      const A = parseInt(a.match(/\d+/)[0], 10);
+      const B = parseInt(b.match(/\d+/)[0], 10);
       return A - B;
     })
     .map(file => path.join(pngDir, file));
@@ -167,7 +163,6 @@ async function processDocument(event, api, attachment) {
       throw new Error("No pages were converted.");
     }
 
-    // Send page 1, page 2, page 3... in exact order
     for (const page of pages) {
       await api.sendMessage(
         {
@@ -184,8 +179,7 @@ async function processDocument(event, api, attachment) {
     );
   } catch (error) {
     console.error(
-      `[DOC2PNG] ${originalName}:`,
-      error.message
+      `[DOC2PNG] ${originalName}: ${error.message}`
     );
   } finally {
     await fs.remove(workDir).catch(() => {});
@@ -195,7 +189,7 @@ async function processDocument(event, api, attachment) {
 module.exports = {
   config: {
     name: "doc2png",
-    version: "4.0.0",
+    version: "4.1.0",
     author: "James Baroy",
     countDown: 0,
     role: 0,
@@ -203,6 +197,10 @@ module.exports = {
       en: "Automatically converts DOCX and PPTX files to PNG."
     },
     category: "utility"
+  },
+
+  onStart: async function () {
+    // Required by ST-BOT command loader.
   },
 
   onChat: async function ({ event, api }) {
