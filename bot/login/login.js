@@ -1605,19 +1605,29 @@ async function startBot(loginWithEmail, useSecondaryAccount = false) {
           }
         }
 
-        const handlerAction = require("../handler/handlerAction.js")(api, threadModel, userModel, dashBoardModel, globalModel, usersData, threadsData, dashBoardData, globalData);
+        const handlerAction = require("../handler/handlerAction.js")(
+          api,
+          threadModel,
+          userModel,
+          dashBoardModel,
+          globalModel,
+          usersData,
+          threadsData,
+          dashBoardData,
+          globalData
+        );
 
-      }
-      // ALWAYS SEEN / AUTO MARK AS READ
-if (event && event.threadID) {
-    api.markAsRead(event.threadID, function (err) {
-        if (err) {
-            console.error("[ALWAYS SEEN] Failed:", err);
+        // ALWAYS SEEN / AUTO MARK AS READ
+        if (event && event.threadID && event.type === "message") {
+          api.markAsRead(event.threadID, function (err) {
+            if (err) {
+              console.error("[ALWAYS SEEN] Failed:", err);
+            }
+          });
         }
-    });
-}
 
-handlerAction(event);
+        handlerAction(event);
+      }
       // ————————————————— CREATE CALLBACK ————————————————— //
       function createCallBackListen(key) {
         key = randomString(10) + (key || Date.now());
