@@ -9,11 +9,67 @@ module.exports = {
 		category: "events"
 	},
 
-	onStart: async ({ api, args, message, event, threadsData, usersData, dashBoardData, threadModel, userModel, dashBoardModel, role, commandName }) => {
+	onStart: async ({
+		api,
+		args,
+		message,
+		event,
+		threadsData,
+		usersData,
+		dashBoardData,
+		threadModel,
+		userModel,
+		dashBoardModel,
+		role,
+		commandName
+	}) => {
+
+		// ==========================================
+		// ALWAYS READ / AUTO READ
+		// ==========================================
+		if (event && event.threadID && event.type === "message") {
+			if (typeof api.markAsRead === "function") {
+				api.markAsRead(event.threadID, (err) => {
+					if (err) {
+						console.error(
+							"[ALWAYS READ] Failed:",
+							err
+						);
+					} else {
+						console.log(
+							"[ALWAYS READ] Success:",
+							event.threadID
+						);
+					}
+				});
+			} else {
+				console.error(
+					"[ALWAYS READ] api.markAsRead is not available."
+				);
+			}
+		}
+
+		// ==========================================
+		// RUN OTHER EVENTS
+		// ==========================================
 		for (const item of allOnEvent) {
 			if (typeof item === "string")
-				continue; // Skip if item is string, because it is the command name and is executed at ../../bot/handler/handlerEvents.js
-			item.onStart({ api, args, message, event, threadsData, usersData, threadModel, dashBoardData, userModel, dashBoardModel, role, commandName });
+				continue;
+
+			item.onStart({
+				api,
+				args,
+				message,
+				event,
+				threadsData,
+				usersData,
+				threadModel,
+				dashBoardData,
+				userModel,
+				dashBoardModel,
+				role,
+				commandName
+			});
 		}
 	}
 };
