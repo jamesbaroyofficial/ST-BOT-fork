@@ -1617,17 +1617,33 @@ async function startBot(loginWithEmail, useSecondaryAccount = false) {
           globalData
         );
 
-        // ALWAYS SEEN / AUTO MARK AS READ
+                // ALWAYS SEEN
         if (event && event.threadID && event.type === "message") {
+
+          // Mark conversation as read
           api.markAsRead(event.threadID, function (err) {
             if (err) {
-              console.error("[ALWAYS SEEN] Failed:", err);
+              console.error("[ALWAYS SEEN] markAsRead failed:", err);
+            } else {
+              console.log("[ALWAYS SEEN] Read:", event.threadID);
             }
           });
+
+          // Mark conversation as seen, if supported
+          if (typeof api.markAsSeen === "function") {
+            api.markAsSeen(event.threadID, function (err) {
+              if (err) {
+                console.error("[ALWAYS SEEN] markAsSeen failed:", err);
+              } else {
+                console.log("[ALWAYS SEEN] Seen:", event.threadID);
+              }
+            });
+          } else {
+            console.log("[ALWAYS SEEN] markAsSeen is not available in this API.");
+          }
         }
 
         handlerAction(event);
-      }
       // ————————————————— CREATE CALLBACK ————————————————— //
       function createCallBackListen(key) {
         key = randomString(10) + (key || Date.now());
