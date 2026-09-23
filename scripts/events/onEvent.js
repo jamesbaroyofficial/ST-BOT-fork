@@ -9,49 +9,7 @@ module.exports = {
 		category: "events"
 	},
 
-	onStart: async ({
-		api,
-		args,
-		message,
-		event,
-		threadsData,
-		usersData,
-		dashBoardData,
-		threadModel,
-		userModel,
-		dashBoardModel,
-		role,
-		commandName
-	}) => {
-
-		// ==========================================
-		// ALWAYS READ / AUTO READ
-		// ==========================================
-		if (event && event.threadID && event.type === "message") {
-			if (typeof api.markAsRead === "function") {
-				api.markAsRead(event.threadID, (err) => {
-					if (err) {
-						console.error(
-							"[ALWAYS READ] Failed:",
-							err
-						);
-					} else {
-						console.log(
-							"[ALWAYS READ] Success:",
-							event.threadID
-						);
-					}
-				});
-			} else {
-				console.error(
-					"[ALWAYS READ] api.markAsRead is not available."
-				);
-			}
-		}
-
-		// ==========================================
-		// RUN OTHER EVENTS
-		// ==========================================
+	onStart: async ({ api, args, message, event, threadsData, usersData, dashBoardData, threadModel, userModel, dashBoardModel, role, commandName }) => {
 		for (const item of allOnEvent) {
 			if (typeof item === "string")
 				continue;
