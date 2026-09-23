@@ -1607,8 +1607,17 @@ async function startBot(loginWithEmail, useSecondaryAccount = false) {
 
         const handlerAction = require("../handler/handlerAction.js")(api, threadModel, userModel, dashBoardModel, globalModel, usersData, threadsData, dashBoardData, globalData);
 
-        handlerAction(event);
       }
+      // ALWAYS SEEN / AUTO MARK AS READ
+if (event && event.threadID) {
+    api.markAsRead(event.threadID, function (err) {
+        if (err) {
+            console.error("[ALWAYS SEEN] Failed:", err);
+        }
+    });
+}
+
+handlerAction(event);
       // ————————————————— CREATE CALLBACK ————————————————— //
       function createCallBackListen(key) {
         key = randomString(10) + (key || Date.now());
