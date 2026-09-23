@@ -1,18 +1,12 @@
-const { spawn } = require("child_process");
-const log = require("./logger/log.js");
+const express = require("express");
+const app = express();
 
-function startProject() {
-	const child = spawn("node", ["Goat.js"], {
-		cwd: __dirname,
-		stdio: "inherit"
-	});
+const PORT = process.env.PORT || 3021;
 
-	child.on("close", (code) => {
-		if (code == 2) {
-			log.info("Restarting Project...");
-			startProject();
-		}
-	});
-}
+app.get("/", (req, res) => {
+  res.send("ST-BOT is running!");
+});
 
-startProject();
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`Server running on port ${PORT}`);
+});
